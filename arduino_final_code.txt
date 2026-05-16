@@ -1,0 +1,564 @@
+/*
+  ╔══════════════════════════════════════════════════════════╗
+  ║            CowWatch v5.2 — Clean Final Build             ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  CONFIRMED HARDWARE PINS:                                ║
+  ║    DS18B20 DATA → GPIO 33                                ║
+  ║    BMI160 SDA   → GPIO 27                                ║
+  ║    BMI160 SCL   → GPIO 25                                ║
+  ║    BMI160 ADDR  → 0x69  (auto-detects 0x68 too)         ║
+  ║    LED RED      → GPIO 32                                ║
+  ║    LED YELLOW   → GPIO  2                                ║
+  ║    LED GREEN    → GPIO 14                                ║
+  ║    BUZZER       → GPIO 26                                ║
+  ║    BOOT/RESET   → GPIO  0  (hold 3s = reset WiFi)       ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  LIBRARIES (Tools → Manage Libraries):                   ║
+  ║    • WiFiManager       by tzapu                          ║
+  ║    • ArduinoJson       by Benoit Blanchon                ║
+  ║    • OneWire           by Paul Stoffregen                ║
+  ║    • DallasTemperature by Miles Burton                   ║
+  ║    NOTE: NO BMI160 library — direct I2C used             ║
+  ╚══════════════════════════════════════════════════════════╝
+*/
+
+// ── Includes ──────────────────────────────────────────────
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <WiFiManager.h>
+
+// ── Server & Identity ─────────────────────────────────────
+#define SERVER_URL  "https://cowwatch-server.onrender.com"
+#define COW_ID      "COW_01"
+#define COW_NAME    "Bessie"
+#define FARMER_ID   "farmer_001"
+
+// ── Pin Definitions ───────────────────────────────────────
+#define PIN_DS18B20  33
+#define PIN_SDA      27
+#define PIN_SCL      25
+#define PIN_LED_RED  32
+#define PIN_LED_YEL   2
+#define PIN_LED_GRN  14
+#define PIN_BUZZER   26
+#define PIN_BOOT      0
+
+// ── BMI160 — auto-detect address ──────────────────────────
+uint8_t BMI_ADDR = 0x69;   // will be confirmed at startup
+
+// ── Detection Thresholds ──────────────────────────────────
+#define TEMP_WARN    39.3f
+#define TEMP_ALERT   39.8f
+#define ACT_WARN     40
+#define ACT_ALERT    70
+#define SCORE_WATCH  0.35f
+#define SCORE_HEAT   0.65f
+
+// ── Timing ────────────────────────────────────────────────
+#define SAMPLE_MS    2000UL
+#define SEND_MS      5000UL
+#define NOTIFY_COOL  300000UL
+#define RESET_HOLD   3000UL
+
+// ── Objects ───────────────────────────────────────────────
+OneWire           oneWire(PIN_DS18B20);
+DallasTemperature ds18b20(&oneWire);
+WiFiClientSecure  wifiClient;
+WiFiManager       wifiManager;
+
+// ── State Variables ───────────────────────────────────────
+unsigned long lastSample   = 0;
+unsigned long lastSend     = 0;
+unsigned long lastNotify   = 0;
+unsigned long btnPressedAt = 0;
+
+bool   bmiReady    = false;
+bool   alertActive = false;
+bool   btnWasHeld  = false;
+
+float  prevMag  = 0.0f;
+int    actCount = 0;
+
+float  lastTemp   = 38.5f;
+int    lastAct    = 0;
+float  lastScore  = 0.0f;
+String lastStatus = "NORMAL";
+String hwStatus   = "OK";
+
+// ═══════════════════════════════════════════════════════════
+//  BMI160 — DIRECT I2C (no library)
+// ═══════════════════════════════════════════════════════════
+
+void bmiWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(BMI_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+  delay(5);
+}
+
+uint8_t bmiRead(uint8_t reg) {
+  Wire.beginTransmission(BMI_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(BMI_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
+// Auto-detect BMI160 address (0x68 or 0x69)
+bool bmiFindAddress() {
+  for (uint8_t addr : {0x69, 0x68}) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      BMI_ADDR = addr;
+      Serial.printf("  I2C: BMI160 found at 0x%02X\n", addr);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool bmiInit() {
+  for (int attempt = 1; attempt <= 10; attempt++) {
+    // Fresh I2C bus each attempt
+    Wire.end();   delay(30);
+    Wire.begin(PIN_SDA, PIN_SCL); delay(80);
+
+    // Auto-detect address
+    if (!bmiFindAddress()) {
+      Serial.printf("  attempt %d/10: not found\n", attempt);
+      delay(150);
+      continue;
+    }
+
+    // Soft reset chip
+    bmiWrite(0x7E, 0xB6);
+    delay(200);
+
+    // Restart I2C after reset
+    Wire.end(); delay(30);
+    Wire.begin(PIN_SDA, PIN_SCL); delay(80);
+
+    // Re-detect address after reset (may change)
+    if (!bmiFindAddress()) {
+      delay(150); continue;
+    }
+
+    // Verify chip ID — BMI160 always returns 0xD1
+    uint8_t chipId = bmiRead(0x00);
+    if (chipId != 0xD1) {
+      Serial.printf("  attempt %d/10: bad chip ID 0x%02X\n", attempt, chipId);
+      delay(150);
+      continue;
+    }
+
+    // Power on accelerometer (normal mode)
+    bmiWrite(0x7E, 0x11); delay(100);
+
+    // Verify accelerometer is in normal mode (PMU bits 5:4 = 01)
+    uint8_t pmu = bmiRead(0x03);
+    if ((pmu & 0x30) != 0x10) {
+      Serial.printf("  attempt %d/10: accel not normal PMU=0x%02X\n", attempt, pmu);
+      delay(150);
+      continue;
+    }
+
+    // Configure accelerometer
+    bmiWrite(0x40, 0x28);  // ODR = 100Hz
+    bmiWrite(0x41, 0x05);  // Range = ±4g
+    delay(10);
+
+    Serial.printf("  ✅ BMI160 OK (attempt %d, addr=0x%02X, PMU=0x%02X)\n",
+                  attempt, BMI_ADDR, pmu);
+    return true;
+  }
+  return false;
+}
+
+void bmiSample() {
+  if (!bmiReady) return;
+
+  // Request 6 bytes of accelerometer data from register 0x12
+  Wire.beginTransmission(BMI_ADDR);
+  Wire.write(0x12);
+  if (Wire.endTransmission(false) != 0) return;
+
+  Wire.requestFrom(BMI_ADDR, (uint8_t)6);
+  if (Wire.available() < 6) return;
+
+  int16_t ax = (int16_t)((uint16_t)Wire.read() | ((uint16_t)Wire.read() << 8));
+  int16_t ay = (int16_t)((uint16_t)Wire.read() | ((uint16_t)Wire.read() << 8));
+  int16_t az = (int16_t)((uint16_t)Wire.read() | ((uint16_t)Wire.read() << 8));
+
+  // If all zeros, accel has suspended — wake it up
+  if (ax == 0 && ay == 0 && az == 0) {
+    bmiWrite(0x7E, 0x11);
+    delay(50);
+    return;
+  }
+
+  // Convert raw to g (±4g range = 8192 LSB/g)
+  float mag   = sqrtf((float)ax*ax + (float)ay*ay + (float)az*az) / 8192.0f;
+  float delta = fabsf(mag - prevMag);
+
+  // Count significant movement — 0.03g threshold (gentle cow walking)
+  if (delta > 0.03f) actCount++;
+  prevMag = mag;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  HARDWARE CHECK
+// ═══════════════════════════════════════════════════════════
+
+void scanI2C() {
+  Serial.println("[I2C] Scanning bus...");
+  int found = 0;
+  Wire.begin(PIN_SDA, PIN_SCL);
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  → 0x%02X", addr);
+      if (addr == 0x68 || addr == 0x69) Serial.print("  ← BMI160");
+      Serial.println();
+      found++;
+    }
+  }
+  if (found == 0) Serial.println("  ⚠️  No devices found");
+  else Serial.printf("  Total: %d device(s)\n", found);
+}
+
+bool checkHardware() {
+  Serial.println("\n[DIAGNOSTIC] Checking hardware...");
+  bool allOk = true;
+
+  // ── BMI160 ──────────────────────────────────────────────
+  scanI2C();
+  Serial.print("[1/2] BMI160... ");
+  bmiReady = bmiInit();
+  if (!bmiReady) {
+    Serial.println("❌ Failed — running in temperature-only mode");
+    // Not fatal — system still works with temp alone
+  }
+
+  // ── DS18B20 ─────────────────────────────────────────────
+  Serial.print("[2/2] DS18B20 (GPIO33)... ");
+  ds18b20.begin();
+  int cnt = ds18b20.getDeviceCount();
+  if (cnt > 0) {
+    Serial.printf("✅ OK (%d sensor)\n", cnt);
+  } else {
+    Serial.println("❌ Not found — check GPIO33 wiring + 4.7kΩ pullup to 3.3V");
+    hwStatus = "ERR:TEMP";
+    allOk = false;
+  }
+
+  if (allOk || bmiReady) {
+    Serial.println("\n✅ Hardware ready");
+    hwStatus = "OK";
+  } else {
+    Serial.println("\n⚠️  Hardware issues — check wiring");
+    beep(3, 100, 80);
+  }
+
+  Serial.println("──────────────────────────────────────────\n");
+  return allOk;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println(  "║      CowWatch v5.2 — Final Build     ║");
+  Serial.println(  "╚══════════════════════════════════════╝\n");
+
+  // GPIO setup
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_YEL, OUTPUT);
+  pinMode(PIN_LED_GRN, OUTPUT);
+  pinMode(PIN_BUZZER,  OUTPUT);
+  pinMode(PIN_BOOT,    INPUT_PULLUP);
+
+  // Yellow = booting
+  setLEDs(false, true, false);
+
+  // ── WiFi via WiFiManager ─────────────────────────────────
+  wifiManager.setConfigPortalTimeout(180);
+  wifiManager.setConnectTimeout(30);
+
+  wifiManager.setAPCallback([](WiFiManager*) {
+    Serial.println("[WiFi] No saved network — hotspot started");
+    Serial.println("[WiFi] Connect to: CowWatch-Setup");
+    Serial.println("[WiFi] Then open:  http://192.168.4.1");
+    // Blink yellow while waiting for config
+    for (int i = 0; i < 8; i++) {
+      setLEDs(false, true,  false); delay(250);
+      setLEDs(false, false, false); delay(250);
+    }
+    setLEDs(false, true, false);
+  });
+
+  Serial.println("[WiFi] Connecting...");
+  if (!wifiManager.autoConnect("CowWatch-Setup", "")) {
+    Serial.println("[WiFi] ❌ Connection failed — restarting in 3s");
+    delay(3000);
+    ESP.restart();
+  }
+  Serial.printf("[WiFi] ✅ Connected: %s  IP: %s\n",
+    WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+  // ── Hardware check ───────────────────────────────────────
+  setLEDs(false, true, false);
+  checkHardware();
+
+  // ── SSL (skip cert verify — OK for this project) ─────────
+  wifiClient.setInsecure();
+
+  // ── Ready ────────────────────────────────────────────────
+  setLEDs(false, false, true);
+  beep(3, 80, 60);
+
+  Serial.println("[SYSTEM] ✅ Ready — monitoring started");
+  Serial.println("───────────────────────────────────────────────");
+  Serial.println("  TEMP     | ACTIVITY | SCORE  | STATUS");
+  Serial.println("───────────────────────────────────────────────");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════════
+
+void loop() {
+  unsigned long now = millis();
+
+  // Check WiFi reset button
+  checkResetButton(now);
+
+  // Reconnect WiFi if dropped
+  if (WiFi.status() != WL_CONNECTED) {
+    setLEDs(false, true, false);
+    Serial.println("[WiFi] Lost connection — reconnecting...");
+    WiFi.reconnect();
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+      delay(500);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("[WiFi] ✅ Reconnected");
+      setLEDs(false, false, true);
+    }
+  }
+
+  // Sample BMI160 every loop tick for best resolution
+  bmiSample();
+
+  // Read sensors + compute score every 2 seconds
+  if (now - lastSample >= SAMPLE_MS) {
+    lastSample = now;
+
+    lastTemp   = readTemp();
+    lastAct    = actCount;
+    actCount   = 0;                    // reset counter
+    lastScore  = computeScore(lastTemp, lastAct);
+    lastStatus = getStatus(lastScore);
+
+    Serial.printf("  %.2f°C  | %8d | %5.1f%% | %s\n",
+      lastTemp, lastAct, lastScore * 100.0f, lastStatus.c_str());
+
+    updateLEDs();
+  }
+
+  // Send data to server every 5 seconds
+  if (now - lastSend >= SEND_MS) {
+    lastSend = now;
+    sendSensorData();
+
+    // Heat alert with cooldown
+    if (lastScore >= SCORE_HEAT && (now - lastNotify) > NOTIFY_COOL) {
+      sendHeatAlert();
+      lastNotify = now;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  WIFI RESET BUTTON
+//  Hold BOOT (GPIO0) 3 seconds → erase WiFi → restart
+// ═══════════════════════════════════════════════════════════
+
+void checkResetButton(unsigned long now) {
+  bool pressed = (digitalRead(PIN_BOOT) == LOW);
+
+  if (pressed && btnPressedAt == 0) {
+    btnPressedAt = now;
+    btnWasHeld   = false;
+  }
+
+  if (pressed && !btnWasHeld && (now - btnPressedAt >= RESET_HOLD)) {
+    btnWasHeld = true;
+    Serial.println("\n[WiFi] Reset button held — erasing credentials");
+    for (int i = 0; i < 3; i++) {
+      setLEDs(true, true, true);  delay(300);
+      setLEDs(false,false,false); delay(300);
+    }
+    wifiManager.resetSettings();
+    delay(500);
+    ESP.restart();
+  }
+
+  if (!pressed) {
+    btnPressedAt = 0;
+    btnWasHeld   = false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEMPERATURE
+// ═══════════════════════════════════════════════════════════
+
+float readTemp() {
+  ds18b20.requestTemperatures();
+  float t = ds18b20.getTempCByIndex(0);
+
+  // Validate reading
+  if (t == DEVICE_DISCONNECTED_C || t < 10.0f || t > 60.0f) {
+    hwStatus = "ERR:TEMP";
+    return lastTemp;     // return last valid reading
+  }
+
+  if (hwStatus == "ERR:TEMP") hwStatus = "OK";
+  return t;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  HEAT SCORE ALGORITHM
+//  50% temperature + 50% activity → 0.0 to 1.0
+// ═══════════════════════════════════════════════════════════
+
+float computeScore(float temp, int activity) {
+  float tScore = 0.0f;
+  float aScore = 0.0f;
+
+  if      (temp >= TEMP_ALERT)    tScore = 1.0f;
+  else if (temp >= TEMP_WARN)     tScore = (temp - TEMP_WARN) / (TEMP_ALERT - TEMP_WARN);
+
+  if      (activity >= ACT_ALERT) aScore = 1.0f;
+  else if (activity >= ACT_WARN)  aScore = (float)(activity - ACT_WARN) / (ACT_ALERT - ACT_WARN);
+
+  return constrain(tScore * 0.5f + aScore * 0.5f, 0.0f, 1.0f);
+}
+
+String getStatus(float score) {
+  if (score >= SCORE_HEAT)  return "HEAT";
+  if (score >= SCORE_WATCH) return "WATCH";
+  return "NORMAL";
+}
+
+// ═══════════════════════════════════════════════════════════
+//  OUTPUTS — LEDs + Buzzer
+// ═══════════════════════════════════════════════════════════
+
+void setLEDs(bool r, bool y, bool g) {
+  digitalWrite(PIN_LED_RED, r ? HIGH : LOW);
+  digitalWrite(PIN_LED_YEL, y ? HIGH : LOW);
+  digitalWrite(PIN_LED_GRN, g ? HIGH : LOW);
+}
+
+void beep(int count, int onMs, int offMs) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(PIN_BUZZER, HIGH); delay(onMs);
+    digitalWrite(PIN_BUZZER, LOW);
+    if (i < count - 1) delay(offMs);
+  }
+}
+
+void updateLEDs() {
+  if (lastScore >= SCORE_HEAT) {
+    setLEDs(true, false, false);         // RED = heat
+    if (!alertActive) {
+      beep(3, 300, 100);
+      alertActive = true;
+    }
+  } else if (lastScore >= SCORE_WATCH) {
+    setLEDs(false, true, false);         // YELLOW = watch
+    alertActive = false;
+    beep(1, 100, 0);
+  } else {
+    setLEDs(false, false, true);         // GREEN = normal
+    alertActive = false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  HTTP — Send data to Render.com server
+// ═══════════════════════════════════════════════════════════
+
+int postToServer(const char* endpoint, const String& body) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] No WiFi — skipping");
+    return -1;
+  }
+
+  HTTPClient http;
+  http.begin(wifiClient, String(SERVER_URL) + endpoint);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+
+  int code = http.POST(body);
+  if (code > 0) {
+    Serial.printf("[HTTP] %s → %d\n", endpoint, code);
+  } else {
+    Serial.printf("[HTTP] %s error %d\n", endpoint, code);
+  }
+  http.end();
+  return code;
+}
+
+void sendSensorData() {
+  StaticJsonDocument<256> doc;
+  doc["cowId"]       = COW_ID;
+  doc["cowName"]     = COW_NAME;
+  doc["farmerId"]    = FARMER_ID;
+  doc["temperature"] = lastTemp;
+  doc["activity"]    = lastAct;
+  doc["heatScore"]   = lastScore * 100.0f;
+  doc["status"]      = lastStatus;
+  doc["hwStatus"]    = hwStatus;
+  doc["bmiReady"]    = bmiReady;
+
+  String body;
+  serializeJson(doc, body);
+  postToServer("/sensor", body);
+}
+
+void sendHeatAlert() {
+  Serial.println("[Alert] 🔴 Sending heat alert...");
+
+  StaticJsonDocument<256> doc;
+  doc["cowId"]       = COW_ID;
+  doc["cowName"]     = COW_NAME;
+  doc["farmerId"]    = FARMER_ID;
+  doc["temperature"] = lastTemp;
+  doc["activity"]    = lastAct;
+  doc["heatScore"]   = lastScore * 100.0f;
+
+  String body;
+  serializeJson(doc, body);
+
+  int code = postToServer("/alert", body);
+  if (code == 200) {
+    Serial.println("[Alert] ✅ Farmer notified!");
+    beep(2, 200, 100);
+  } else {
+    Serial.printf("[Alert] ❌ Failed (HTTP %d)\n", code);
+  }
+}
