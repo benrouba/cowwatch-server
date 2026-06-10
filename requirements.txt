@@ -1,0 +1,6 @@
+flask
+xgboost
+scikit-learn
+joblib
+numpy
+firebase-admin

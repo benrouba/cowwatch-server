@@ -1,0 +1,7 @@
+/mmcows
+*.zip
+*.log
+.mmcows.zip
+/venv
+# *.csv
+/model_output/preprocessed.csv
