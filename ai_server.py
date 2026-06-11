@@ -8,6 +8,10 @@ from firebase_admin import credentials, db as rtdb, messaging
 import numpy as np, joblib, os, json, datetime
 from collections import deque
 
+# ── Model paths (relative to this file) ──
+_DIR      = os.path.dirname(os.path.abspath(__file__))
+_MDL      = os.path.join(_DIR, "model_output")
+
 # ── Init Firebase ──────────────────────────────────────────────
 cred = credentials.Certificate(
     json.loads(os.environ['FIREBASE_SERVICE_ACCOUNT']))
@@ -15,10 +19,11 @@ firebase_admin.initialize_app(cred, {
     'databaseURL': os.environ['FIREBASE_DATABASE_URL']})
 
 # ── Load model ─────────────────────────────────────────────────
-model     = joblib.load('heat_model.pkl')  # XGBoost
-scaler    = joblib.load('scaler.pkl')
-threshold = joblib.load('threshold.pkl')
-with open('model_config.json', encoding='utf-8') as f:
+# Paths relative to project root (model_output/ is a subfolder)
+model     = joblib.load(os.path.join(_MDL, 'heat_model.pkl'))
+scaler    = joblib.load(os.path.join(_MDL, 'scaler.pkl'))
+threshold = joblib.load(os.path.join(_MDL, 'threshold.pkl'))
+with open(os.path.join(_MDL, 'model_config.json'), encoding='utf-8') as f:
     cfg = json.load(f)
 
 WINDOW   = cfg['window_samples']
