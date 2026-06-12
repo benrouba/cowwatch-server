@@ -180,8 +180,8 @@ def sensor():
         if len(b) >= WINDOW // 4:
             ai_prob = predict_heat(b)
         else:
-            # Not enough history yet — fall back to rule-based score
-            ai_prob = float(d.get('heatScore', 0)) / 100.0
+            raw     = float(d.get('heatScore', 0))
+            ai_prob = raw / 100.0 if raw > 1.0 else raw
 
         # Determine status from threshold
         if ai_prob >= threshold:
@@ -191,6 +191,7 @@ def sensor():
         else:
             status = 'NORMAL'
 
+        # score is ALWAYS 0-100 — never 0-1 — consistent for app and Firebase
         score = round(ai_prob * 100, 2)
 
         print(f"[{cow_id}] temp={temp:.1f}°C act={act} "
