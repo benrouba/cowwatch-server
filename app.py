@@ -220,7 +220,7 @@ def sensor():
             'cowName':      d.get('cowName', cow_id),
             'temperature':  temp,
             'activity':     act,
-            'heatScore':    score,
+            'heatScore':    score_pct,
             'ruleScore':    d.get('heatScore', 0),
             'status':       status,
             'hwStatus':     d.get('hwStatus', 'OK'),
@@ -230,7 +230,7 @@ def sensor():
             'timestamp':    ts,
         }
 
-        def _write_firebase(payload, cow_id, status, score, ts, d):
+        def _write_firebase(payload, cow_id, status, score_pct, ts, d):
             try:
                 rtdb.reference(f'/cows/{cow_id}/latest').set(payload)
                 rtdb.reference(f'/cows/{cow_id}/history').push(payload)
@@ -263,7 +263,7 @@ def sensor():
                                 notification=messaging.Notification(
                                     title=f"🔴 Chaleur — {d.get('cowName', cow_id)}",
                                     body=f"Temp: {float(d.get('temperature',0)):.1f}°C"
-                                         f" · Score IA: {score:.0f}%"
+                                         f" · Score IA: {score_pct:.0f}%"
                                          f" · Inséminer dans 6–18h"),
                                 data={
                                     'type':    'HEAT_ALERT',
@@ -280,7 +280,7 @@ def sensor():
 
         threading.Thread(
             target=_write_firebase,
-            args=(payload, cow_id, status, score, ts, d),
+            args=(payload, cow_id, status, score_pct, ts, d),
             daemon=True
         ).start()
 
@@ -302,8 +302,8 @@ def alert():
 
         cow_id = d.get('cowId', 'COW_01')
         temp   = float(d.get('temperature', 0))
-        score  = float(d.get('heatScore', 0))
-        ts     = int(d.get('timestamp', 0))
+        score_pct = float(d.get('heatScore', 0))
+        ts        = int(d.get('timestamp', 0))
 
         if not valid_temp(temp):
             return jsonify({'status': 'rejected', 'reason': 'invalid_temp'})
@@ -324,7 +324,7 @@ def alert():
                 messaging.send(messaging.Message(
                     notification=messaging.Notification(
                         title=f"🔴 Alerte chaleur — {d.get('cowName', cow_id)}",
-                        body=f"Temp: {temp:.1f}°C · Score: {score:.0f}%"),
+                        body=f"Temp: {temp:.1f}°C · Score: {score_pct:.0f}%"),
                     data={'type': 'HEAT_ALERT', 'cowId': cow_id},
                     token=token,
                 ))
