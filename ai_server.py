@@ -7,6 +7,20 @@ import firebase_admin
 from firebase_admin import credentials, db as rtdb, messaging
 import numpy as np, joblib, os, json, datetime
 from collections import deque
+import threading, requests
+
+# ── Keep-alive: ping self every 14 min to prevent Render sleep ──
+def _keep_alive():
+    import time
+    while True:
+        time.sleep(14 * 60)
+        try:
+            url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:5000')
+            requests.get(f"{url}/health", timeout=10)
+        except:
+            pass
+
+threading.Thread(target=_keep_alive, daemon=True).start()
 
 # ── Model paths (relative to this file) ──
 _DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -134,7 +148,7 @@ def sensor():
 
 @app.route('/health')
 def health():
-    return jsonify({'status':'ok','model':'bilstm_attention',
+    return jsonify({'status':'ok','model':'xgboost',
                     'window_min':WINDOW*2//60})
 
 if __name__ == '__main__':
