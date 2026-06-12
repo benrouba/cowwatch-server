@@ -180,6 +180,8 @@ def sensor():
         if len(b) >= WINDOW // 4:
             ai_prob = predict_heat(b)
         else:
+            # Not enough history yet — fall back to rule-based score
+            # Handle both scales: ESP32 sends 0-100, XGBoost returns 0-1
             raw     = float(d.get('heatScore', 0))
             ai_prob = raw / 100.0 if raw > 1.0 else raw
 
