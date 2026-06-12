@@ -185,25 +185,31 @@ def sensor():
             raw     = float(d.get('heatScore', 0))
             ai_prob = raw / 100.0 if raw > 1.0 else raw
 
-        # Determine status from threshold
-        if ai_prob >= threshold:
+        # Convert to 0-100 scale
+        score_pct  = round(ai_prob * 100, 2)
+
+        # Temperature gate — sensor must be on cow (≥37.5°C)
+        temp_valid = temp >= 37.5
+
+        # Determine status using percentage thresholds
+        thr_pct   = threshold * 100          # e.g. 0.75 → 75%
+        watch_pct = thr_pct * 0.6            # e.g. 75×0.6 = 45%
+
+        if score_pct >= thr_pct and temp_valid:
             status = 'HEAT'
-        elif ai_prob >= threshold * 0.6:
+        elif score_pct >= watch_pct and temp_valid:
             status = 'WATCH'
         else:
-            status = 'NORMAL'
-
-        # score is ALWAYS 0-100 — never 0-1 — consistent for app and Firebase
-        score = round(ai_prob * 100, 2)
+            status = 'NORMAL' 
 
         print(f"[{cow_id}] temp={temp:.1f}°C act={act} "
-              f"ai={score:.1f}% status={status} fill={fill:.0%}")
+              f"ai={score_pct:.1f}% status={status} fill={fill:.0%}")
 
         # ── Respond to ESP32 immediately ─────────────────────
         # Firebase writes happen in background — ESP32 gets answer in <1s
         response = jsonify({
             'status':     'ok',
-            'ai_score':   score,
+            'ai_score':   score_pct,
             'ai_status':  status,
             'confidence': round(fill, 2),
         })
@@ -247,7 +253,7 @@ def sensor():
                             'cowName':     d.get('cowName', cow_id),
                             'temperature': float(d.get('temperature', 0)),
                             'activity':    int(d.get('activity', 0)),
-                            'heatScore':   score,
+                            'heatScore':   score_pct,
                             'notified':    True,
                             'timestamp':   ts,
                         })
@@ -264,7 +270,7 @@ def sensor():
                                     'cowId':   cow_id,
                                     'cowName': d.get('cowName', cow_id),
                                     'temp':    str(d.get('temperature', 0)),
-                                    'score':   str(score),
+                                    'score':   str(score_pct),
                                 },
                                 token=token,
                             ))
@@ -307,7 +313,7 @@ def alert():
             'cowName':     d.get('cowName', cow_id),
             'temperature': temp,
             'activity':    d.get('activity', 0),
-            'heatScore':   score,
+            'heatScore':   score_pct,
             'notified':    True,
             'timestamp':   ts,
         })
