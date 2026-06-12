@@ -67,6 +67,11 @@ ACT_THR  = cfg.get('activity_thresh_ms2', 0.294)
 # Per-cow sliding window buffer
 buffers = {}
 
+# In-memory alert cooldown — avoids Firebase race condition
+# { cow_id: last_alert_server_time_seconds }
+last_alert_time = {}
+ALERT_COOLDOWN_S = 5 * 60   # 5 minutes
+
 # ── Warmup — run a dummy prediction at startup ────────────────
 # Eliminates 10-12 second delay on first real request
 def _warmup():
@@ -139,6 +144,8 @@ def sensor():
         temp   = float(d.get('temperature', 0))
         act    = int(d.get('activity', 0))
         ts     = int(d.get('timestamp', 0))
+        # Use server time for cooldown (ESP32 sends timestamp=0)
+        server_ts = int(datetime.datetime.now().timestamp() * 1000)
 
         # Reject invalid temperature (sensor disconnected = 55°C etc.)
         if not valid_temp(temp):
@@ -254,46 +261,55 @@ def sensor():
             except Exception as e:
                 print(f"[Firebase] ❌ prune failed (harmless): {e}")
 
-            # Step 4 — FCM alert (completely isolated — failure never affects steps 1-3)
+            # Step 4 — FCM alert with in-memory cooldown (no Firebase read needed)
             if status == 'HEAT':
-                try:
-                    alert_ref  = rtdb.reference(f'/alerts/{cow_id}')
-                    last_alert = alert_ref.get() or {}
-                    cooldown   = 5 * 60 * 1000  # 5 minutes ms
-                    if not last_alert or (ts - last_alert.get('timestamp', 0)) > cooldown:
-                        alert_ref.set({
+                import time
+                now_s      = time.time()
+                last_sent  = last_alert_time.get(cow_id, 0)
+                on_cooldown = (now_s - last_sent) < ALERT_COOLDOWN_S
+
+                if on_cooldown:
+                    remaining = int(ALERT_COOLDOWN_S - (now_s - last_sent))
+                    print(f"[FCM] Cooldown active for {cow_id} — {remaining}s remaining")
+                else:
+                    # Write alert to Firebase
+                    try:
+                        rtdb.reference(f'/alerts/{cow_id}').set({
                             'cowId':       cow_id,
                             'cowName':     d.get('cowName', cow_id),
                             'temperature': float(d.get('temperature', 0)),
                             'activity':    int(d.get('activity', 0)),
                             'heatScore':   score_pct,
                             'notified':    True,
-                            'timestamp':   ts,
+                            'timestamp':   server_ts,
                         })
-                except Exception as e:
-                    print(f"[Firebase] ❌ alert write failed: {e}")
+                    except Exception as e:
+                        print(f"[Firebase] ❌ alert write failed: {e}")
 
-                try:
-                    token = rtdb.reference('/farm/fcmToken').get()
-                    if token:
-                        messaging.send(messaging.Message(
-                            notification=messaging.Notification(
-                                title=f"Chaleur — {d.get('cowName', cow_id)}",
-                                body=(f"Temp: {float(d.get('temperature',0)):.1f}C"
-                                      f" Score IA: {score_pct:.0f}%"
-                                      f" Inseminer dans 6-18h")),
-                            data={
-                                'type':    'HEAT_ALERT',
-                                'cowId':   cow_id,
-                                'cowName': d.get('cowName', cow_id),
-                                'temp':    str(d.get('temperature', 0)),
-                                'score':   str(score_pct),
-                            },
-                            token=token,
-                        ))
-                        print(f"[FCM] Alert sent for {cow_id}")
-                except Exception as e:
-                    print(f"[FCM] Failed (data still saved): {e}")
+                    # Send FCM notification
+                    try:
+                        token = rtdb.reference('/farm/fcmToken').get()
+                        if token:
+                            messaging.send(messaging.Message(
+                                notification=messaging.Notification(
+                                    title=f"Chaleur — {d.get('cowName', cow_id)}",
+                                    body=(f"Temp: {float(d.get('temperature',0)):.1f}C"
+                                          f" Score IA: {score_pct:.0f}%"
+                                          f" Inseminer dans 6-18h")),
+                                data={
+                                    'type':    'HEAT_ALERT',
+                                    'cowId':   cow_id,
+                                    'cowName': d.get('cowName', cow_id),
+                                    'temp':    str(d.get('temperature', 0)),
+                                    'score':   str(score_pct),
+                                },
+                                token=token,
+                            ))
+                            # Record time AFTER successful send
+                            last_alert_time[cow_id] = now_s
+                            print(f"[FCM] ✅ Alert sent for {cow_id} — next in 5 min")
+                    except Exception as e:
+                        print(f"[FCM] ❌ Send failed: {e}")
 
         threading.Thread(
             target=_write_firebase,
