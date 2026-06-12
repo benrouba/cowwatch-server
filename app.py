@@ -231,22 +231,35 @@ def sensor():
         }
 
         def _write_firebase(payload, cow_id, status, score_pct, ts, d):
+            # Step 1 — Write latest data (always, never skip)
             try:
                 rtdb.reference(f'/cows/{cow_id}/latest').set(payload)
-                rtdb.reference(f'/cows/{cow_id}/history').push(payload)
+                print(f"[Firebase] ✅ latest written for {cow_id}")
+            except Exception as e:
+                print(f"[Firebase] ❌ latest write failed: {e}")
 
-                # Prune history to last 100 entries
+            # Step 2 — Write history (always, never skip)
+            try:
+                rtdb.reference(f'/cows/{cow_id}/history').push(payload)
+            except Exception as e:
+                print(f"[Firebase] ❌ history write failed: {e}")
+
+            # Step 3 — Prune history (optional, failure is harmless)
+            try:
                 hist_ref = rtdb.reference(f'/cows/{cow_id}/history')
                 hist     = hist_ref.get() or {}
                 if len(hist) > 100:
                     for k in sorted(hist.keys())[:len(hist) - 100]:
                         hist_ref.child(k).delete()
+            except Exception as e:
+                print(f"[Firebase] ❌ prune failed (harmless): {e}")
 
-                # FCM alert if heat detected
-                if status == 'HEAT':
+            # Step 4 — FCM alert (completely isolated — failure never affects steps 1-3)
+            if status == 'HEAT':
+                try:
                     alert_ref  = rtdb.reference(f'/alerts/{cow_id}')
                     last_alert = alert_ref.get() or {}
-                    cooldown   = 5 * 60 * 1000
+                    cooldown   = 5 * 60 * 1000  # 5 minutes ms
                     if not last_alert or (ts - last_alert.get('timestamp', 0)) > cooldown:
                         alert_ref.set({
                             'cowId':       cow_id,
@@ -257,26 +270,30 @@ def sensor():
                             'notified':    True,
                             'timestamp':   ts,
                         })
-                        token = rtdb.reference('/farm/fcmToken').get()
-                        if token:
-                            messaging.send(messaging.Message(
-                                notification=messaging.Notification(
-                                    title=f"🔴 Chaleur — {d.get('cowName', cow_id)}",
-                                    body=f"Temp: {float(d.get('temperature',0)):.1f}°C"
-                                         f" · Score IA: {score_pct:.0f}%"
-                                         f" · Inséminer dans 6–18h"),
-                                data={
-                                    'type':    'HEAT_ALERT',
-                                    'cowId':   cow_id,
-                                    'cowName': d.get('cowName', cow_id),
-                                    'temp':    str(d.get('temperature', 0)),
-                                    'score':   str(score_pct),
-                                },
-                                token=token,
-                            ))
-                            print(f"[FCM] ✅ Alert sent for {cow_id}")
-            except Exception as e:
-                print(f"[Firebase] Error: {e}")
+                except Exception as e:
+                    print(f"[Firebase] ❌ alert write failed: {e}")
+
+                try:
+                    token = rtdb.reference('/farm/fcmToken').get()
+                    if token:
+                        messaging.send(messaging.Message(
+                            notification=messaging.Notification(
+                                title=f"Chaleur — {d.get('cowName', cow_id)}",
+                                body=(f"Temp: {float(d.get('temperature',0)):.1f}C"
+                                      f" Score IA: {score_pct:.0f}%"
+                                      f" Inseminer dans 6-18h")),
+                            data={
+                                'type':    'HEAT_ALERT',
+                                'cowId':   cow_id,
+                                'cowName': d.get('cowName', cow_id),
+                                'temp':    str(d.get('temperature', 0)),
+                                'score':   str(score_pct),
+                            },
+                            token=token,
+                        ))
+                        print(f"[FCM] Alert sent for {cow_id}")
+                except Exception as e:
+                    print(f"[FCM] Failed (data still saved): {e}")
 
         threading.Thread(
             target=_write_firebase,
